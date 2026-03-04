@@ -1,0 +1,427 @@
+# ==========================================
+# 1. CONFIGURATION LDAP (DOCKER COMPOSE)
+# ==========================================
+- name: Configurer LDAP et phpLDAPadmin via Docker
+  hosts: ldap
+  become: yes
+  tasks:
+    - name: Purger l'ancienne installation LDAP native (Libère les ports)
+      apt:
+        name: [slapd, ldap-utils, apache2, phpldapadmin]
+        state: absent
+        purge: yes
+      ignore_errors: yes
+
+    - name: Installer Docker et prérequis
+      apt:
+        name: [ca-certificates, curl, gnupg, docker.io, docker-compose]
+        state: present
+        update_cache: yes
+
+    - name: Créer l'arborescence /opt/ldap
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /opt/ldap
+        - /opt/ldap/data
+        - /opt/ldap/config
+
+    - name: Appliquer les permissions pour l'utilisateur OpenLDAP (911)
+      shell: "chown -R 911:911 /opt/ldap/data /opt/ldap/config"
+
+    - name: Créer le fichier docker-compose.yml
+      copy:
+        dest: /opt/ldap/docker-compose.yml
+        content: |
+          services:
+            openldap:
+              image: osixia/openldap:1.5.0
+              container_name: openldap
+              hostname: "{{ inventory_hostname }}"
+              environment:
+                - LDAP_ORGANISATION=starberrinum
+                - LDAP_DOMAIN=starberrinum.local
+                - LDAP_ADMIN_PASSWORD=password
+                - LDAP_CONFIG_PASSWORD=password
+                - LDAP_TLS=false
+                - LDAP_REPLICATION=true
+                - "LDAP_REPLICATION_HOSTS=#PYTHON2BASH:['ldap://ldap-1', 'ldap://ldap-2']"
+              extra_hosts:
+                - "ldap-1:{{ hostvars['ldap-1']['ansible_host'] }}"
+                - "ldap-2:{{ hostvars['ldap-2']['ansible_host'] }}"
+              ports:
+                - "389:389"
+              volumes:
+                - /opt/ldap/data:/var/lib/ldap
+                - /opt/ldap/config:/etc/ldap/slapd.d
+              networks:
+                - ldap-net
+              restart: unless-stopped
+
+            phpldapadmin:
+              image: osixia/phpldapadmin:0.9.0
+              container_name: phpldapadmin
+              environment:
+                - PHPLDAPADMIN_LDAP_HOSTS=openldap
+                - PHPLDAPADMIN_HTTPS=false
+              depends_on:
+                - openldap
+              ports:
+                - "80:80"
+              networks:
+                - ldap-net
+              restart: unless-stopped
+
+          networks:
+            ldap-net:
+              driver: bridge
+
+    - name: Créer le dossier custom_schema
+      file:
+        path: /opt/ldap/custom_schema
+        state: directory
+        mode: "0755"
+
+    - name: Télécharger le schéma Samba
+      get_url:
+        url: "https://raw.githubusercontent.com/samba-team/samba/master/examples/LDAP/samba.schema"
+        dest: "/opt/ldap/custom_schema/samba.schema"
+
+    - name: Démarrer le cluster LDAP (Docker Compose)
+      command: docker-compose up -d
+      args:
+        chdir: /opt/ldap
+
+# ==========================================
+# 2. CONFIGURATION DU LOAD BALANCER & HA (NGINX)
+# ==========================================
+- name: Configurer la Haute Disponibilité NGINX
+  hosts: nginx
+  become: yes
+  vars:
+    vip_address: "10.1.102.100"
+  tasks:
+    - name: Nettoyer les fichiers APT corrompus
+      file:
+        path: /etc/apt/sources.list.d/docker.sources
+        state: absent
+
+    - name: Installer Nginx, Keepalived et module Stream
+      apt:
+        name:
+          - nginx
+          - libnginx-mod-stream
+          - keepalived
+        state: present
+        update_cache: yes
+
+    - name: Configurer Keepalived (Interface ens18)
+      copy:
+        dest: /etc/keepalived/keepalived.conf
+        content: |
+          vrrp_instance VI_1 {
+              state {{ keepalived_state }}
+              interface ens18
+              virtual_router_id 51
+              priority {{ keepalived_priority }}
+              advert_int 1
+              virtual_ipaddress {
+                  {{ vip_address }}
+              }
+          }
+      notify: Restart Keepalived
+
+    - name: Configurer Nginx (Equilibrage Jellyfin - HTTP)
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          upstream jellyfin_cluster {
+              ip_hash;
+              server {{ hostvars['jellyfin-1']['ansible_host'] }}:8096;
+              server {{ hostvars['jellyfin-2']['ansible_host'] }}:8096;
+          }
+          server {
+              listen 80;
+              server_name _;
+              location / {
+                  proxy_pass http://jellyfin_cluster;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+              }
+          }
+      notify: Restart Nginx
+
+    - name: Configurer Nginx (Equilibrage LDAP - TCP)
+      blockinfile:
+        path: /etc/nginx/nginx.conf
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - LDAP STREAM"
+        block: |
+          stream {
+              upstream ldap_backend {
+                  server {{ hostvars['ldap-1']['ansible_host'] }}:389;
+                  server {{ hostvars['ldap-2']['ansible_host'] }}:389;
+              }
+              server {
+                  listen 389;
+                  proxy_pass ldap_backend;
+                  proxy_timeout 2s;
+                  proxy_connect_timeout 1s;
+              }
+          }
+      notify: Restart Nginx
+
+  handlers:
+    - name: Restart Keepalived
+      service:
+        name: keepalived
+        state: restarted
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+
+# ==========================================
+# 3. CONFIGURATION DU STOCKAGE (SAMBA)
+# ==========================================
+- name: Configurer le serveur Samba
+  hosts: samba
+  become: yes
+  tasks:
+    - name: Nettoyer les fichiers APT corrompus (Packer fix)
+      file:
+        path: /etc/apt/sources.list.d/docker.sources
+        state: absent
+
+    - name: Preseed nslcd (URI LDAP via IP virtuelle Nginx)
+      debconf:
+        name: nslcd
+        question: nslcd/ldap-uris
+        value: "ldap://10.1.102.100"
+        vtype: string
+
+    - name: Preseed nslcd (Base DN)
+      debconf:
+        name: nslcd
+        question: nslcd/ldap-base
+        value: "dc=starberrinum,dc=local"
+        vtype: string
+
+    - name: Preseed libnss-ldapd (Services à relier)
+      debconf:
+        name: libnss-ldapd
+        question: libnss-ldapd/nsswitch
+        value: "group, passwd, shadow"
+        vtype: multiselect
+
+    - name: Installer les paquets Samba et LDAP client
+      apt:
+        name:
+          - samba
+          - smbldap-tools
+          - nslcd
+          - libnss-ldapd
+          - libpam-ldapd
+        state: present
+        update_cache: yes
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Activer la création automatique des dossiers Home (PAM)
+      lineinfile:
+        path: /etc/pam.d/common-session
+        line: "session required pam_mkhomedir.so skel=/etc/skel/ umask=0077"
+        insertbefore: BOF
+
+    - name: Créer le dossier pour les médias
+      file:
+        path: /mnt/gros_disque/media
+        state: directory
+        mode: "0777"
+
+    - name: Configurer smb.conf (Global LDAP + Media + Homes)
+      blockinfile:
+        path: /etc/samba/smb.conf
+        insertafter: "\\[global\\]"
+        block: |
+          passdb backend = ldapsam:ldap://10.1.102.100
+          ldap suffix = dc=starberrinum,dc=local
+          ldap user suffix = ou=users
+          ldap group suffix = ou=groups
+          ldap admin dn = cn=admin,dc=starberrinum,dc=local
+          ldap ssl = off
+      notify: Restart Samba
+
+    - name: Ajouter les partages dans smb.conf
+      blockinfile:
+        path: /etc/samba/smb.conf
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - SHARES"
+        block: |
+          [media]
+          path = /mnt/gros_disque/media
+          browseable = yes
+          writeable = yes
+          guest ok = yes
+
+          [homes]
+          comment = Home Directories
+          browseable = no
+          read only = no
+          create mask = 0700
+          directory mask = 0700
+          valid users = %S
+      notify: Restart Samba
+
+    - name: Donner le mot de passe admin LDAP à Samba
+      shell: smbpasswd -w "password"
+
+    - name: S'assurer que le service Samba est démarré et actif
+      service:
+        name: smbd
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Restart Samba
+      service:
+        name: smbd
+        state: restarted
+    - name: Restart nslcd
+      service:
+        name: nslcd
+        state: restarted
+
+# ==========================================
+# 4. CONFIGURATION DU MULTIMÉDIA (JELLYFIN)
+# ==========================================
+- name: Configurer les noeuds Jellyfin
+  hosts: jellyfin
+  become: yes
+  tasks:
+    - name: Nettoyer les fichiers APT corrompus (Packer fix)
+      file:
+        path: /etc/apt/sources.list.d/docker.sources
+        state: absent
+
+    - name: Installer Docker et prérequis
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - cifs-utils
+          - gnupg
+          - docker.io
+          - docker-compose
+        state: present
+        update_cache: yes
+
+    - name: Créer le point de montage local
+      file:
+        path: /media/samba_partage
+        state: directory
+
+    - name: Monter le partage média Samba
+      mount:
+        path: /mnt/media
+        src: "//{{ hostvars['samba-server']['ansible_host'] }}/media"
+        fstype: cifs
+        opts: "username=jellyfin,password=jellyfin,vers=3.0"
+        state: mounted
+
+    - name: Créer le répertoire pour Jellyfin
+      file:
+        path: /opt/jellyfin
+        state: directory
+        mode: "0755"
+
+    - name: Créer le docker-compose.yml
+      copy:
+        dest: /opt/jellyfin/docker-compose.yml
+        content: |
+          services:
+            jellyfin:
+              image: lscr.io/linuxserver/jellyfin:latest
+              container_name: jellyfin
+              environment:
+                - PUID=1000
+                - PGID=1000
+                - TZ=Europe/Paris
+              ports:
+                - "8096:8096"
+              volumes:
+                - /opt/jellyfin/config:/config
+                - /mnt/media:/data
+              restart: unless-stopped
+
+    - name: Démarrer Jellyfin
+      command: docker-compose up -d
+      args:
+        chdir: /opt/jellyfin
+
+    - name: Installer les outils de synchro
+      apt:
+        name: [rsync, python3]
+        state: present
+
+    - name: Déposer le script de fusion des notes
+      copy:
+        dest: /opt/jellyfin/merge_ratings.py
+        mode: '0755'
+        content: |
+          import json
+          import sys
+          import os
+
+          def merge_json(file1, file2, output):
+              data = {}
+              if os.path.exists(file1):
+                  with open(file1, 'r') as f:
+                      data.update(json.load(f))
+              if os.path.exists(file2):
+                  with open(file2, 'r') as f:
+                      data.update(json.load(f))
+              with open(output, 'w') as f:
+                  json.dump(data, f, indent=2)
+
+          if __name__ == "__main__":
+              merge_json(sys.argv[1], sys.argv[2], sys.argv[3])
+
+    - name: Déposer le script de synchronisation Bash
+      copy:
+        dest: /opt/jellyfin/sync_ratings.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          CONFIG_DIR="/config/data/plugins/configurations/UserRatings"
+          HOST_CONFIG_DIR="/opt/jellyfin/config/data/plugins/configurations/UserRatings"
+          SAMBA_FILE="/mnt/media/jellyfin_shared_data/UserRatings/ratings.json"
+
+          # S'assurer que les répertoires existent
+          mkdir -p /mnt/media/jellyfin_shared_data/UserRatings
+          mkdir -p $HOST_CONFIG_DIR
+
+          # Créer des JSON vides si absents
+          [ ! -f "$SAMBA_FILE" ] && echo "{}" > "$SAMBA_FILE"
+
+          # Récupérer JSON local et distant
+          docker cp jellyfin:$CONFIG_DIR/ratings.json /tmp/local_ratings.json 2>/dev/null || echo "{}" > /tmp/local_ratings.json
+          cp "$SAMBA_FILE" /tmp/remote_ratings.json
+
+          # Fusion via Python
+          python3 /opt/jellyfin/merge_ratings.py /tmp/local_ratings.json /tmp/remote_ratings.json /tmp/merged_ratings.json
+
+          # Réinjecter
+          cp /tmp/merged_ratings.json "$SAMBA_FILE"
+          docker exec -u 0 jellyfin mkdir -p $CONFIG_DIR
+          docker cp /tmp/merged_ratings.json jellyfin:$CONFIG_DIR/ratings.json
+          docker exec -u 0 jellyfin chown -R 1000:1000 /config/data/plugins/configurations/
+
+    - name: Créer le cron (Appel du script)
+      cron:
+        name: "Sync Jellyfin Ratings"
+        minute: "*/2"
+        job: "/bin/bash /opt/jellyfin/sync_ratings.sh > /dev/null 2>&1"
